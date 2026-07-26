@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.vscode/
+# We intentionally DO NOT ignore data/options_pipeline.db because we want to sync it!

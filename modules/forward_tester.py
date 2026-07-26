@@ -1,0 +1,141 @@
+import yfinance as yf
+import pandas as pd
+from datetime import datetime
+import logging
+from modules.storage_setup import DatabaseManager
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("ForwardTester")
+
+class ForwardTester:
+    """
+    Evaluates all OPEN signals in the database against live market prices.
+    Updates statuses to WON, LOST, or EXPIRED to build historical accuracy data.
+    """
+    def __init__(self):
+        self.db = DatabaseManager()
+
+    def evaluate_open_signals(self) -> None:
+        """
+        Fetches all OPEN signals, gets live prices, and applies the rules:
+        - If mark >= target: WON
+        - If mark <= stop_loss: LOST
+        - If today > expiration: EXPIRED
+        """
+        with self.db.get_connection() as conn:
+            # 1. Fetch all OPEN signals
+            open_signals_df = pd.read_sql("SELECT * FROM signals WHERE status = 'OPEN'", conn)
+            
+        if open_signals_df.empty:
+            logger.info("No OPEN signals to evaluate.")
+            return
+
+        logger.info(f"Evaluating {len(open_signals_df)} OPEN signals...")
+        today_date = datetime.today().date()
+        today_str = datetime.today().strftime('%Y-%m-%d %H:%M:%S')
+        
+        updates = []
+        evaluations = []
+
+        for _, row in open_signals_df.iterrows():
+            signal_id = row['signal_id']
+            option_symbol = row['option_symbol']
+            target = row['target_price']
+            stop = row['stop_loss_price']
+            exp_date = datetime.strptime(row['expiration_date'], '%Y-%m-%d').date()
+
+            # 2. Check for expiration FIRST
+            if today_date > exp_date:
+                updates.append(( 'EXPIRED', signal_id ))
+                logger.info(f"Signal {signal_id} ({option_symbol}) EXPIRED.")
+                continue
+
+            # 3. Fetch current live price from yfinance
+            try:
+                ticker = yf.Ticker(option_symbol)
+                # We need the most recent quote. Using fast_info or history.
+                hist = ticker.history(period="1d")
+                if hist.empty:
+                    logger.warning(f"Could not fetch live price for {option_symbol}. Skipping.")
+                    continue
+                    
+                # Use Close price as current mark
+                current_price = hist['Close'].iloc[-1]
+                
+            except Exception as e:
+                logger.error(f"Error fetching data for {option_symbol}: {e}")
+                continue
+
+            # 4. Log this check in our evaluations table (so we can see the path it took)
+            evaluations.append((signal_id, today_str, round(current_price, 2), "Daily Check"))
+
+            # 5. Check Win/Loss conditions
+            new_status = 'OPEN'
+            if current_price >= target:
+                new_status = 'WON'
+                logger.info(f"Signal {signal_id} WON! Price {current_price} hit target {target}.")
+            elif current_price <= stop:
+                new_status = 'LOST'
+                logger.info(f"Signal {signal_id} LOST. Price {current_price} hit stop {stop}.")
+
+            if new_status != 'OPEN':
+                updates.append(( new_status, signal_id ))
+
+        # 6. Save updates to the database
+        self._commit_updates(updates, evaluations)
+
+    def _commit_updates(self, updates: list, evaluations: list) -> None:
+        """Executes the SQL updates transactionally."""
+        if not updates and not evaluations:
+            return
+
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Update statuses
+            if updates:
+                cursor.executemany("UPDATE signals SET status = ? WHERE signal_id = ?", updates)
+                logger.info(f"Updated status for {len(updates)} signals.")
+
+            # Insert evaluation logs
+            if evaluations:
+                eval_sql = """
+                INSERT INTO signal_evaluations (signal_id, check_timestamp, current_mark_price, notes)
+                VALUES (?, ?, ?, ?)
+                """
+                cursor.executemany(eval_sql, evaluations)
+                logger.info(f"Logged {len(evaluations)} price evaluations.")
+                
+            conn.commit()
+
+    def print_performance_metrics(self) -> None:
+        """Calculates and prints simple metrics from the database."""
+        with self.db.get_connection() as conn:
+            df = pd.read_sql("SELECT status, count(*) as cnt FROM signals GROUP BY status", conn)
+            
+        if df.empty:
+            print("No signals in database.")
+            return
+            
+        metrics = dict(zip(df['status'], df['cnt']))
+        won = metrics.get('WON', 0)
+        lost = metrics.get('LOST', 0)
+        total_closed = won + lost
+        
+        print("\n=== SYSTEM PERFORMANCE ===")
+        print(f"OPEN Signals:    {metrics.get('OPEN', 0)}")
+        print(f"WON Signals:     {won}")
+        print(f"LOST Signals:    {lost}")
+        print(f"EXPIRED Signals: {metrics.get('EXPIRED', 0)}")
+        
+        if total_closed > 0:
+            win_rate = (won / total_closed) * 100
+            print(f"WIN RATE:        {win_rate:.2f}%")
+        else:
+            print("WIN RATE:        N/A (No closed trades yet)")
+        print("==========================\n")
+
+if __name__ == "__main__":
+    tester = ForwardTester()
+    tester.evaluate_open_signals()
+    tester.print_performance_metrics()
