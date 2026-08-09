@@ -6,53 +6,54 @@ from sklearn.metrics import accuracy_score, precision_score, brier_score_loss
 import logging
 import json
 from pathlib import Path
+from modules.storage_setup import DatabaseManager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("MLPipeline")
 
 class XGBoostRanker:
-    """
-    Trains and executes an XGBoost classifier to predict the probability 
-    of an option contract hitting the profit target before the stop loss.
-    """
-    
     def __init__(self, model_path: str = "models/xgb_model.json"):
         self.model_path = Path(model_path)
         self.model = None
+        self.db = DatabaseManager()
         
-        # The exact features our FeatureEngineer outputs
+        # PRUNED FEATURE LIST - Focusing only on the top 5 heavyweights
         self.features = [
-            'RSI_14', 'ATR_14', 'EMA_Alignment', 
-            'Vol_OI_Ratio', 'Norm_Strike_Dist', 
-            'Delta', 'Gamma', 'Theta', 'Vega', 'impliedVolatility'
+            'Delta', 'RSI_14', 'Norm_Strike_Dist', 
+            'ATR_14', 'impliedVolatility'
         ]
-        self.target = 'target_hit' # Binary: 1 (Won), 0 (Lost/Expired)
+        self.target = 'target_hit'
+
+    def get_training_data(self) -> pd.DataFrame:
+        """Pulls all closed trades that have recorded feature data."""
+        query = "SELECT * FROM signals WHERE status IN ('WON', 'LOST') AND RSI_14 IS NOT NULL"
+        with self.db.get_connection() as conn:
+            df = pd.read_sql(query, conn)
+            
+        if not df.empty:
+            df['target_hit'] = (df['status'] == 'WON').astype(int)
+            df['entry_date'] = pd.to_datetime(df['entry_date'])
+            df = df.sort_values('entry_date').reset_index(drop=True)
+            
+            # Drop rows where any of our 5 features are missing
+            df = df.dropna(subset=self.features)
+        return df
 
     def train(self, df: pd.DataFrame) -> None:
-        """
-        Trains the XGBoost model using Time-Series Cross-Validation 
-        to ensure no look-ahead bias (data leakage).
-        """
-        logger.info(f"Starting model training with {len(df)} samples...")
-        
-        # Ensure data is sorted by date for time-series split
-        df = df.sort_values(by='entry_date').reset_index(drop=True)
-        
+        logger.info(f"Training pruned model on {len(df)} real historical trades...")
         X = df[self.features]
         y = df[self.target]
 
-        # TimeSeriesSplit ensures we only train on the past to predict the future
         tscv = TimeSeriesSplit(n_splits=5)
         
-        # Basic XGBoost hyperparameters optimized for probability ranking
         params = {
             'objective': 'binary:logistic',
             'eval_metric': 'logloss',
-            'max_depth': 4,
-            'learning_rate': 0.05,
-            'subsample': 0.8,
+            'max_depth': 3,
+            'learning_rate': 0.01,
+            'subsample': 0.7,
             'colsample_bytree': 0.8,
-            'n_estimators': 100,
+            'n_estimators': 50,
             'random_state': 42
         }
 
@@ -61,49 +62,55 @@ class XGBoostRanker:
         brier_scores = []
         precisions = []
 
-        # Cross-validation loop
-        for train_index, test_index in tscv.split(X):
-            X_train, X_test = X.iloc[train_index], X.iloc[test_index]
-            y_train, y_test = y.iloc[train_index], y.iloc[test_index]
+        if len(df) > 50:
+            for train_index, test_index in tscv.split(X):
+                X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+                y_train, y_test = y.iloc[train_index], y.iloc[test_index]
 
-            self.model.fit(X_train, y_train)
-            
-            # Predict probabilities
-            probs = self.model.predict_proba(X_test)[:, 1]
-            preds = (probs > 0.5).astype(int)
+                self.model.fit(X_train, y_train)
+                
+                probs = self.model.predict_proba(X_test)[:, 1]
+                preds = (probs > 0.5).astype(int)
 
-            # Brier score measures accuracy of probabilistic predictions
-            brier = brier_score_loss(y_test, probs)
-            precision = precision_score(y_test, preds, zero_division=0)
-            
-            brier_scores.append(brier)
-            precisions.append(precision)
+                brier = brier_score_loss(y_test, probs)
+                precision = precision_score(y_test, preds, zero_division=0)
+                
+                brier_scores.append(brier)
+                precisions.append(precision)
 
-        logger.info("Cross-Validation Complete.")
-        logger.info(f"Average Brier Score: {np.mean(brier_scores):.4f}")
-        logger.info(f"Average Precision: {np.mean(precisions):.4f}")
+            logger.info("Cross-Validation Complete.")
+            logger.info(f"Average Brier Score: {np.mean(brier_scores):.4f}")
+            logger.info(f"Average Precision: {np.mean(precisions):.4f}")
 
-        # Retrain on the entire dataset for final model
-        logger.info("Retraining on full dataset...")
+        # Final retrain on the entire dataset
         self.model.fit(X, y)
         self.save_model()
+        self.print_feature_importance()
+
+    def print_feature_importance(self) -> None:
+        if self.model is None:
+            return
+        
+        importance = self.model.feature_importances_
+        feat_imp = pd.DataFrame({'Feature': self.features, 'Importance': importance})
+        feat_imp = feat_imp.sort_values(by='Importance', ascending=False)
+        
+        print("\n" + "="*40)
+        print("PRUNED XGBOOST FEATURE IMPORTANCE")
+        print("="*40)
+        for _, row in feat_imp.iterrows():
+            print(f"{row['Feature']:<20}: {row['Importance']:.4f}")
+        print("="*40 + "\n")
 
     def predict_signals(self, live_features_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Takes live options data, outputs confidence scores, and ranks them.
-        """
         if self.model is None:
             self.load_model()
             
         X_live = live_features_df[self.features]
-        
-        # Get probability of class 1 (Hitting target)
         probabilities = self.model.predict_proba(X_live)[:, 1]
         
         live_features_df = live_features_df.copy()
         live_features_df['confidence_score'] = probabilities
-        
-        # Sort by highest confidence
         live_features_df = live_features_df.sort_values(by='confidence_score', ascending=False)
         return live_features_df
 
@@ -118,29 +125,3 @@ class XGBoostRanker:
             raise FileNotFoundError(f"No trained model found at {self.model_path}")
         self.model = xgb.XGBClassifier()
         self.model.load_model(self.model_path)
-        logger.info("Model loaded successfully.")
-
-def _generate_mock_historical_data(num_samples: int = 1000) -> pd.DataFrame:
-    """Helper to generate synthetic bootstrap data for initial run."""
-    np.random.seed(42)
-    dates = pd.date_range(start='2023-01-01', periods=num_samples, freq='h')
-    
-    df = pd.DataFrame({
-        'entry_date': dates,
-        'RSI_14': np.random.uniform(20, 80, num_samples),
-        'ATR_14': np.random.uniform(1, 10, num_samples),
-        'EMA_Alignment': np.random.choice([-1, 0, 1], num_samples),
-        'Vol_OI_Ratio': np.random.uniform(0.1, 5.0, num_samples),
-        'Norm_Strike_Dist': np.random.uniform(-3, 3, num_samples),
-        'Delta': np.random.uniform(-1, 1, num_samples),
-        'Gamma': np.random.uniform(0, 0.1, num_samples),
-        'Theta': np.random.uniform(-0.5, 0, num_samples),
-        'Vega': np.random.uniform(0, 1, num_samples),
-        'impliedVolatility': np.random.uniform(0.1, 1.0, num_samples),
-    })
-    
-    logit = (df['RSI_14'] - 50) * 0.05 + df['Vol_OI_Ratio'] * 0.5 + np.random.normal(0, 1, num_samples)
-    probs = 1 / (1 + np.exp(-logit))
-    df['target_hit'] = (probs > 0.5).astype(int)
-    
-    return df
