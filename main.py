@@ -2,7 +2,6 @@ import logging
 import sys
 from pathlib import Path
 
-# Ensure root directory is in sys.path for relative module imports
 sys.path.append(str(Path(__file__).resolve().parent))
 
 from modules.storage_setup import DatabaseManager
@@ -34,11 +33,11 @@ def run_pipeline(tickers: list[str]) -> None:
     raw_options = ingestion.get_filtered_options()
 
     if raw_options.empty:
-        logger.warning("No options met the hard liquidity/DTE filters today. Exiting run.")
+        logger.warning("No options met the hard liquidity filters today. Exiting run.")
         tester.print_performance_metrics()
         return
 
-    logger.info("[Step 4/6] Computing technical indicators and Black-Scholes Greeks...")
+    logger.info("[Step 4/6] Computing technical indicators and Greeks...")
     engineer = FeatureEngineer()
     featured_options = engineer.process_features(raw_options)
 
@@ -60,7 +59,8 @@ def run_pipeline(tickers: list[str]) -> None:
     scored_options = ranker.predict_signals(featured_options)
 
     logger.info("[Step 6/6] Logging actionable trade signals to database...")
-    generator = SignalGenerator(confidence_threshold=0.50)
+    # Updated to strictly enforce the Goldilocks Zone
+    generator = SignalGenerator(min_confidence=0.60, max_confidence=0.80)
     generator.generate_and_store_signals(scored_options)
 
     logger.info("=== PIPELINE EXECUTION COMPLETE ===")

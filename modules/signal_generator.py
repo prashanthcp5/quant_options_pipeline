@@ -8,8 +8,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("SignalGenerator")
 
 class SignalGenerator:
-    def __init__(self, confidence_threshold: float = 0.50):
-        self.confidence_threshold = confidence_threshold
+    def __init__(self, min_confidence: float = 0.60, max_confidence: float = 0.80):
+        self.min_confidence = min_confidence
+        self.max_confidence = max_confidence
         self.db = DatabaseManager()
         self.profit_target_pct = 0.50  
         self.stop_loss_pct = 0.30      
@@ -18,11 +19,14 @@ class SignalGenerator:
         if scored_options_df.empty or 'confidence_score' not in scored_options_df.columns:
             return
 
+        # THE GOLDILOCKS ZONE: Reject anything outside the profitable 60-80% window
         actionable_signals = scored_options_df[
-            scored_options_df['confidence_score'] >= self.confidence_threshold
+            (scored_options_df['confidence_score'] >= self.min_confidence) &
+            (scored_options_df['confidence_score'] <= self.max_confidence)
         ].copy()
 
         if actionable_signals.empty:
+            logger.info("No options fell into the Goldilocks zone today.")
             return
 
         today_str = datetime.today().strftime('%Y-%m-%d %H:%M:%S')
@@ -67,4 +71,4 @@ class SignalGenerator:
                     logger.error(f"Failed to insert signal {signal_id}: {e}")
             
             conn.commit()
-            logger.info(f"Successfully saved {inserted_count} new feature-rich signals.")
+            logger.info(f"Successfully saved {inserted_count} new Goldilocks signals.")
