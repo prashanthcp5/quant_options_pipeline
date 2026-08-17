@@ -117,42 +117,59 @@ def main():
         else:
             st.info("Not enough feature-rich closed trades to plot calibration.")
 
-    # --- NEW CHART: WEEKLY CONFIDENCE TREND ---
+    # --- UPGRADED CHART: MACRO TREND (CONFIDENCE VS WIN RATE) ---
     if not df.empty and 'confidence_score' in df.columns:
         st.markdown("---")
-        st.subheader("📉 Macro Trend: AI Confidence Over Time")
+        st.subheader("📉 Macro Trend: AI Confidence vs. Actual Win Rate")
         
+        # 1. Calculate Weekly Confidence
         trend_df = df.dropna(subset=['confidence_score']).copy()
-        
-        # Group by week starting Monday
         trend_df['Week'] = trend_df['entry_date'].dt.to_period('W').dt.start_time
-        weekly_trend = trend_df.groupby('Week')['confidence_score'].mean().reset_index()
-        weekly_trend['confidence_score'] = (weekly_trend['confidence_score'] * 100).round(2)
+        weekly_conf = trend_df.groupby('Week')['confidence_score'].mean().reset_index()
+        weekly_conf['Avg Confidence (%)'] = (weekly_conf['confidence_score'] * 100).round(2)
         
+        # 2. Calculate Weekly Win Rate
+        closed_trend_df = df[df['status'].isin(['WON', 'LOST'])].copy()
+        if not closed_trend_df.empty:
+            closed_trend_df['Week'] = closed_trend_df['entry_date'].dt.to_period('W').dt.start_time
+            closed_trend_df['Win'] = (closed_trend_df['status'] == 'WON').astype(int)
+            weekly_win = closed_trend_df.groupby('Week')['Win'].mean().reset_index()
+            weekly_win['Win Rate (%)'] = (weekly_win['Win'] * 100).round(2)
+            
+            # Merge both metrics onto the same timeline
+            weekly_trend = pd.merge(weekly_conf[['Week', 'Avg Confidence (%)']], weekly_win[['Week', 'Win Rate (%)']], on='Week', how='left')
+        else:
+            weekly_trend = weekly_conf[['Week', 'Avg Confidence (%)']]
+            weekly_trend['Win Rate (%)'] = 0.0
+
+        # Plot the dual line chart
         fig_trend = px.line(
             weekly_trend,
             x='Week',
-            y='confidence_score',
+            y=['Avg Confidence (%)', 'Win Rate (%)'],
             markers=True,
-            labels={'Week': 'Week', 'confidence_score': 'Avg Confidence (%)'}
+            labels={'value': 'Percentage (%)', 'variable': 'Metric'}
         )
-        fig_trend.update_traces(line_color='#00CC96', marker=dict(size=8))
-        fig_trend.update_layout(yaxis_range=[0, 100])
+        
+        # Custom colors
+        fig_trend.data[0].line.color = '#00CC96'  # Green for Confidence
+        if len(fig_trend.data) > 1:
+            fig_trend.data[1].line.color = '#FFA15A'  # Orange for Win Rate
+            
+        fig_trend.update_layout(yaxis_range=[0, 100], legend_title_text='')
         
         st.plotly_chart(fig_trend, use_container_width=True)
         
         with st.expander("❓ What does this trend mean?"):
              st.markdown("""
-             This line tracks the **average confidence score** of all signals generated each week. 
-             * **Spiking up:** The AI is finding extremely clear setups. (Warning: Watch out for market traps if it gets too high).
-             * **Dipping down:** The market is messy and the AI is struggling to find a clear mathematical edge.
-             * **Steady:** The AI is operating in its normal baseline rhythm.
+             This chart compares how confident the AI *thinks* it is versus how often it *actually* wins, week by week.
+             * **The Gap:** You want the orange line (Win Rate) to be as close to the green line (Confidence) as possible. If the green line spikes up but the orange line drops, the AI is experiencing overconfidence in a shifting market.
+             * **The Trend:** If the orange line is slowly trending upward over time, it means the daily cloud retraining is working and the AI is getting smarter.
              """)
 
     st.markdown("---")
     st.header("📋 Actionable Signals & Position Sizing")
     
-    # --- UPGRADED BANKROLL TOOLTIP ---
     bankroll_help_text = "Your exact total account balance. The AI will use this number to calculate exactly how many dollars to risk."
     bankroll = st.number_input("Enter your total trading bankroll ($):", min_value=100, value=10000, step=100, help=bankroll_help_text)
     
@@ -167,11 +184,9 @@ def main():
     
     open_df = df[df['status'] == 'OPEN'].sort_values(by='confidence_score', ascending=False)
     
-    # Filter dashboard to only show Goldilocks setups
     open_df = open_df[(open_df['confidence_score'] >= 0.60) & (open_df['confidence_score'] <= 0.80)].copy()
     
     if not open_df.empty:
-        # Reward-to-Risk ratio (50% target / 30% stop)
         b = 1.666 
         
         open_df['raw_kelly'] = open_df['confidence_score'] - ((1 - open_df['confidence_score']) / b)
