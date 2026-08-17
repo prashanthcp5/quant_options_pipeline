@@ -67,5 +67,5 @@ def run_pipeline(tickers: list[str]) -> None:
     tester.print_performance_metrics()
 
 if __name__ == "__main__":
-    target_tickers = ["SPY", "QQQ", "AAPL", "NVDA"]
+    target_tickers = ["SPY", "QQQ", "AAPL", "NVDA", "SOFI", "F", "NIO"]
     run_pipeline(tickers=target_tickers)
