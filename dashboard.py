@@ -112,15 +112,58 @@ def main():
                 *   **X-Axis (Bottom):** The AI's internal confidence level when it bought the trade.
                 *   **Y-Axis (Left):** The *actual* win rate of those trades in real life.
                 *   **Favorable:** You want the bars to get taller and greener as you move to the right. 
-                *   **Warning:** Short red bars on the far right indicate "Market Traps" where the AI is overconfident. We now filter these out.
+                *   **Warning:** Short red bars on the far right indicate "Market Traps" where the AI is overconfident. We filter these out.
                 """)
         else:
             st.info("Not enough feature-rich closed trades to plot calibration.")
 
+    # --- NEW CHART: WEEKLY CONFIDENCE TREND ---
+    if not df.empty and 'confidence_score' in df.columns:
+        st.markdown("---")
+        st.subheader("📉 Macro Trend: AI Confidence Over Time")
+        
+        trend_df = df.dropna(subset=['confidence_score']).copy()
+        
+        # Group by week starting Monday
+        trend_df['Week'] = trend_df['entry_date'].dt.to_period('W').dt.start_time
+        weekly_trend = trend_df.groupby('Week')['confidence_score'].mean().reset_index()
+        weekly_trend['confidence_score'] = (weekly_trend['confidence_score'] * 100).round(2)
+        
+        fig_trend = px.line(
+            weekly_trend,
+            x='Week',
+            y='confidence_score',
+            markers=True,
+            labels={'Week': 'Week', 'confidence_score': 'Avg Confidence (%)'}
+        )
+        fig_trend.update_traces(line_color='#00CC96', marker=dict(size=8))
+        fig_trend.update_layout(yaxis_range=[0, 100])
+        
+        st.plotly_chart(fig_trend, use_container_width=True)
+        
+        with st.expander("❓ What does this trend mean?"):
+             st.markdown("""
+             This line tracks the **average confidence score** of all signals generated each week. 
+             * **Spiking up:** The AI is finding extremely clear setups. (Warning: Watch out for market traps if it gets too high).
+             * **Dipping down:** The market is messy and the AI is struggling to find a clear mathematical edge.
+             * **Steady:** The AI is operating in its normal baseline rhythm.
+             """)
+
     st.markdown("---")
     st.header("📋 Actionable Signals & Position Sizing")
     
-    bankroll = st.number_input("Enter your total trading bankroll ($):", min_value=100, value=10000, step=100)
+    # --- UPGRADED BANKROLL TOOLTIP ---
+    bankroll_help_text = "Your exact total account balance. The AI will use this number to calculate exactly how many dollars to risk."
+    bankroll = st.number_input("Enter your total trading bankroll ($):", min_value=100, value=10000, step=100, help=bankroll_help_text)
+    
+    with st.expander("🏦 How does the AI use my Bankroll?"):
+        st.markdown("""
+        **1. Tell the AI what you have:** Enter the total amount of money in your brokerage account in the box above.
+        **2. The Kelly Math:** The AI looks at the probability of each specific trade winning.
+        **3. Your Exact Risk:** It calculates an exact, mathematically optimal dollar amount for you to spend on that trade (The `Suggested Risk` column). 
+        
+        *If the suggested risk says **$150**, it means you should buy enough option contracts for that setup to equal exactly $150.*
+        """)
     
     open_df = df[df['status'] == 'OPEN'].sort_values(by='confidence_score', ascending=False)
     
@@ -131,11 +174,9 @@ def main():
         # Reward-to-Risk ratio (50% target / 30% stop)
         b = 1.666 
         
-        # Calculate raw Kelly Percentage: p - ((1-p)/b)
         open_df['raw_kelly'] = open_df['confidence_score'] - ((1 - open_df['confidence_score']) / b)
         open_df['raw_kelly'] = open_df['raw_kelly'].clip(lower=0) 
         
-        # Calculate the 1/4 Fractional Kelly allocation for conservative risk
         open_df['Suggested Risk ($)'] = (bankroll * (open_df['raw_kelly'] / 4)).round(2)
         
         display_df = open_df[['entry_date', 'underlying_ticker', 'option_symbol', 'confidence_score', 'Suggested Risk ($)', 'entry_mark_price', 'target_price', 'stop_loss_price']].copy()
