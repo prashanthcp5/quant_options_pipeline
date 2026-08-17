@@ -22,12 +22,6 @@ def main():
     df = load_data()
     closed_df = df[df['status'].isin(['WON', 'LOST'])]
     
-    # Define Goldilocks dataframe globally for analytics
-    if not closed_df.empty and 'confidence_score' in closed_df.columns:
-        goldilocks_closed = closed_df[(closed_df['confidence_score'] >= 0.60) & (closed_df['confidence_score'] <= 0.80)]
-    else:
-        goldilocks_closed = pd.DataFrame()
-
     # --- UI OPTIMIZATION: TABS ---
     tab1, tab2, tab3 = st.tabs(["🚀 Paper Trade Simulator", "🧠 Model Analytics", "🎓 Options 101"])
 
@@ -46,7 +40,6 @@ def main():
         if not open_df.empty:
             b = 1.666 
             
-            # Math execution
             open_df['raw_kelly'] = open_df['confidence_score'] - ((1 - open_df['confidence_score']) / b)
             open_df['raw_kelly'] = open_df['raw_kelly'].clip(lower=0) 
             open_df['Suggested Risk ($)'] = (bankroll * (open_df['raw_kelly'] / 4))
@@ -80,13 +73,40 @@ def main():
     with tab2:
         st.header("🧠 Machine Learning Performance")
         
+        # --- NEW DYNAMIC TIME FILTER ---
+        st.markdown("### 🕒 Performance Timeframe")
+        timeframe = st.selectbox(
+            "Select timeframe to calculate metrics:", 
+            ["Last 30 Days", "Last 90 Days", "Year to Date", "All Time"],
+            index=0 # Defaults to "Last 30 Days"
+        )
+        
+        # Apply the filter mathematically
+        filtered_df = df.copy()
+        today = pd.Timestamp.now()
+        
+        if timeframe == "Last 30 Days":
+            filtered_df = filtered_df[filtered_df['entry_date'] >= (today - pd.Timedelta(days=30))]
+        elif timeframe == "Last 90 Days":
+            filtered_df = filtered_df[filtered_df['entry_date'] >= (today - pd.Timedelta(days=90))]
+        elif timeframe == "Year to Date":
+            filtered_df = filtered_df[filtered_df['entry_date'].dt.year == today.year]
+            
+        filtered_closed = filtered_df[filtered_df['status'].isin(['WON', 'LOST'])]
+        
+        if not filtered_closed.empty and 'confidence_score' in filtered_closed.columns:
+            goldilocks_filtered = filtered_closed[(filtered_closed['confidence_score'] >= 0.60) & (filtered_closed['confidence_score'] <= 0.80)]
+        else:
+            goldilocks_filtered = pd.DataFrame()
+
+        # Display dynamically filtered metrics
         col1, col2, col3 = st.columns(3)
-        col1.metric("Total Generated Signals", len(df))
-        if not goldilocks_closed.empty:
-            gold_wins = len(goldilocks_closed[goldilocks_closed['status'] == 'WON'])
-            gold_win_rate = (gold_wins / len(goldilocks_closed)) * 100
+        col1.metric(f"Generated Signals ({timeframe})", len(filtered_df))
+        if not goldilocks_filtered.empty:
+            gold_wins = len(goldilocks_filtered[goldilocks_filtered['status'] == 'WON'])
+            gold_win_rate = (gold_wins / len(goldilocks_filtered)) * 100
             col2.metric("Goldilocks Zone Win Rate", f"{gold_win_rate:.2f}%")
-            col3.metric("Goldilocks Closed Trades", len(goldilocks_closed))
+            col3.metric("Goldilocks Closed Trades", len(goldilocks_filtered))
         else:
             col2.metric("Goldilocks Zone Win Rate", "N/A")
             col3.metric("Goldilocks Closed Trades", 0)
@@ -112,7 +132,7 @@ def main():
                     st.plotly_chart(fig_imp, use_container_width=True)
 
         with chart_col2:
-            st.subheader("Model Calibration")
+            st.subheader("Model Calibration (All-Time)")
             if not closed_df.empty and 'confidence_score' in closed_df.columns:
                 calib_df = closed_df.copy()
                 calib_df['Win'] = (calib_df['status'] == 'WON').astype(int)
