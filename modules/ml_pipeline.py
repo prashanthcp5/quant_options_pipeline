@@ -2,9 +2,8 @@ import pandas as pd
 import numpy as np
 import xgboost as xgb
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import accuracy_score, precision_score, brier_score_loss
+from sklearn.metrics import brier_score_loss, roc_auc_score
 import logging
-import json
 from pathlib import Path
 from modules.storage_setup import DatabaseManager
 
@@ -17,15 +16,16 @@ class XGBoostRanker:
         self.model = None
         self.db = DatabaseManager()
         
-        # PRUNED FEATURE LIST - Focusing only on the top 5 heavyweights
+        # Swapped raw impliedVolatility for normalized IV_Rank
         self.features = [
             'Delta', 'RSI_14', 'Norm_Strike_Dist', 
-            'ATR_14', 'impliedVolatility'
+            'ATR_14', 'IV_Rank' 
         ]
         self.target = 'target_hit'
 
     def get_training_data(self) -> pd.DataFrame:
         """Pulls all closed trades that have recorded feature data."""
+        # Note: We must ensure IV_Rank is selected if it was added to the DB schema
         query = "SELECT * FROM signals WHERE status IN ('WON', 'LOST') AND RSI_14 IS NOT NULL"
         with self.db.get_connection() as conn:
             df = pd.read_sql(query, conn)
@@ -35,15 +35,34 @@ class XGBoostRanker:
             df['entry_date'] = pd.to_datetime(df['entry_date'])
             df = df.sort_values('entry_date').reset_index(drop=True)
             
+            # Map 'impliedVolatility' to 'IV_Rank' if running on old db schema temporarily
+            if 'IV_Rank' not in df.columns and 'impliedVolatility' in df.columns:
+                 logger.warning("IV_Rank missing from old DB schema. Temporarily mapping impliedVolatility to IV_Rank for backward compatibility.")
+                 df['IV_Rank'] = df['impliedVolatility'] * 100 # Rough temporary scale
+
             # Drop rows where any of our 5 features are missing
             df = df.dropna(subset=self.features)
         return df
+
+    def _goldilocks_precision(self, y_true: np.ndarray, probs: np.ndarray) -> float:
+        """
+        Calculates precision specifically for trades that fall into the 
+        deployed 0.60 to 0.80 Goldilocks Zone.
+        """
+        mask = (probs >= 0.60) & (probs <= 0.80)
+        if not np.any(mask):
+            return 0.0 # No trades fell into the deployment zone
+        
+        y_true_filtered = y_true[mask]
+        wins = np.sum(y_true_filtered)
+        return wins / len(y_true_filtered)
 
     def train(self, df: pd.DataFrame) -> None:
         logger.info(f"Training pruned model on {len(df)} real historical trades...")
         X = df[self.features]
         y = df[self.target]
 
+        # Standard TimeSeriesSplit (To be upgraded to Purged Group CV as data grows)
         tscv = TimeSeriesSplit(n_splits=5)
         
         params = {
@@ -60,7 +79,8 @@ class XGBoostRanker:
         self.model = xgb.XGBClassifier(**params)
 
         brier_scores = []
-        precisions = []
+        goldilocks_precisions = []
+        auc_scores = []
 
         if len(df) > 50:
             for train_index, test_index in tscv.split(X):
@@ -70,17 +90,24 @@ class XGBoostRanker:
                 self.model.fit(X_train, y_train)
                 
                 probs = self.model.predict_proba(X_test)[:, 1]
-                preds = (probs > 0.5).astype(int)
 
+                # Calculate True Deployment Metrics
                 brier = brier_score_loss(y_test, probs)
-                precision = precision_score(y_test, preds, zero_division=0)
+                gold_prec = self._goldilocks_precision(y_test.values, probs)
+                
+                # Protect AUC calculation from single-class folds
+                if len(np.unique(y_test)) > 1:
+                    auc = roc_auc_score(y_test, probs)
+                    auc_scores.append(auc)
                 
                 brier_scores.append(brier)
-                precisions.append(precision)
+                goldilocks_precisions.append(gold_prec)
 
             logger.info("Cross-Validation Complete.")
             logger.info(f"Average Brier Score: {np.mean(brier_scores):.4f}")
-            logger.info(f"Average Precision: {np.mean(precisions):.4f}")
+            logger.info(f"Goldilocks Zone Precision: {np.mean(goldilocks_precisions):.4f}")
+            if auc_scores:
+                logger.info(f"ROC AUC Score: {np.mean(auc_scores):.4f}")
 
         # Final retrain on the entire dataset
         self.model.fit(X, y)

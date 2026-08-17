@@ -9,13 +9,15 @@ logger = logging.getLogger("FeatureEngineering")
 
 class FeatureEngineer:
     """
-    Computes technical indicators for the underlying stock and calculates 
-    Options Greeks and dynamics (Black-Scholes) for the options chain.
+    Computes technical indicators for the underlying stock, transforms Volatility into IV Rank,
+    and calculates Options Greeks (Black-Scholes-Merton) accounting for continuous dividend yields.
     """
     
-    def __init__(self, risk_free_rate: float = 0.043):
-        # 4.3% risk-free rate approximation (current Treasury yield context)
+    def __init__(self, risk_free_rate: float = 0.043, dividend_yield: float = 0.015):
+        # 4.3% risk-free rate approximation
         self.r = risk_free_rate  
+        # 1.5% average dividend yield approximation (Merton extension)
+        self.q = dividend_yield
 
     def _get_historical_stock_data(self, ticker: str, period: str = "1y") -> pd.DataFrame:
         """Fetches historical daily data for technical indicators."""
@@ -53,26 +55,32 @@ class FeatureEngineer:
         ranges = pd.concat([high_low, high_close, low_close], axis=1)
         true_range = np.max(ranges, axis=1)
         df['ATR_14'] = true_range.rolling(window=14).mean()
+        
+        # Calculate Historical Volatility (252 trading days) to help establish a baseline
+        df['Daily_Return'] = df['Close'].pct_change()
+        df['Historical_Vol'] = df['Daily_Return'].rolling(window=30).std() * np.sqrt(252)
 
         return df
 
     def calculate_greeks(self, row: pd.Series) -> pd.Series:
         """
-        Calculates Delta, Gamma, Theta, and Vega using the Black-Scholes model.
+        Calculates Delta, Gamma, Theta, and Vega using the Black-Scholes-Merton model 
+        (which accounts for continuous dividend yield 'q').
         """
         S = row['stock_price']
         K = row['strike']
         T = row['DTE'] / 365.0  # Time in years
         sigma = row['impliedVolatility']
         r = self.r
+        q = self.q # Dividend Yield added!
         opt_type = row['option_type']
 
         # Handle edge cases (expired or 0 vol)
         if T <= 0 or sigma <= 0 or S <= 0:
             return pd.Series({'Delta': 0.0, 'Gamma': 0.0, 'Theta': 0.0, 'Vega': 0.0})
 
-        # Black-Scholes d1 and d2
-        d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+        # Black-Scholes-Merton d1 and d2 (Updated with -q)
+        d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
         d2 = d1 - sigma * np.sqrt(T)
 
         # Common terms
@@ -80,29 +88,57 @@ class FeatureEngineer:
         N_d2 = norm.cdf(d2)
         N_prime_d1 = norm.pdf(d1)
 
-        gamma = N_prime_d1 / (S * sigma * np.sqrt(T))
-        vega = S * N_prime_d1 * np.sqrt(T) / 100  # Per 1% change
+        # Greeks updated with the continuous dividend yield discount e^(-qT)
+        gamma = (np.exp(-q * T) * N_prime_d1) / (S * sigma * np.sqrt(T))
+        vega = S * np.exp(-q * T) * N_prime_d1 * np.sqrt(T) / 100  # Per 1% change
 
         if opt_type == 'CALL':
-            delta = N_d1
-            theta = (- (S * sigma * N_prime_d1) / (2 * np.sqrt(T)) 
+            delta = np.exp(-q * T) * N_d1
+            theta = (- (S * sigma * np.exp(-q * T) * N_prime_d1) / (2 * np.sqrt(T)) 
+                     + q * S * np.exp(-q * T) * N_d1 
                      - r * K * np.exp(-r * T) * N_d2) / 365
         else: # PUT
-            delta = N_d1 - 1
-            theta = (- (S * sigma * N_prime_d1) / (2 * np.sqrt(T)) 
+            delta = np.exp(-q * T) * (N_d1 - 1)
+            theta = (- (S * sigma * np.exp(-q * T) * N_prime_d1) / (2 * np.sqrt(T)) 
+                     - q * S * np.exp(-q * T) * norm.cdf(-d1) 
                      + r * K * np.exp(-r * T) * norm.cdf(-d2)) / 365
 
         return pd.Series({'Delta': delta, 'Gamma': gamma, 'Theta': theta, 'Vega': vega})
 
+    def calculate_iv_rank(self, options_df: pd.DataFrame, stock_history_map: dict) -> pd.DataFrame:
+        """
+        Transforms raw Implied Volatility into IV Rank (0 to 100 scale) based on 
+        the stock's 1-year historical volatility high/low baseline.
+        """
+        def get_ivr(row):
+            ticker = row['underlying_ticker']
+            current_iv = row['impliedVolatility']
+            
+            if ticker in stock_history_map and current_iv > 0:
+                hist_vol = stock_history_map[ticker]['Historical_Vol'].dropna()
+                if not hist_vol.empty:
+                    iv_low = hist_vol.min()
+                    iv_high = hist_vol.max()
+                    
+                    if iv_high > iv_low:
+                        # IV Rank Formula
+                        ivr = ((current_iv - iv_low) / (iv_high - iv_low)) * 100
+                        return max(0.0, min(100.0, ivr)) # Cap between 0 and 100
+            return 50.0 # Safe neutral default if missing data
+            
+        options_df['IV_Rank'] = options_df.apply(get_ivr, axis=1)
+        return options_df
+
     def process_features(self, options_df: pd.DataFrame) -> pd.DataFrame:
         """
-        Merges underlying technicals and calculates option-specific features.
+        Merges underlying technicals, transforms IV, and calculates option-specific features.
         """
         if options_df.empty:
             return options_df
 
         tickers = options_df['underlying_ticker'].unique()
         stock_data_map = {}
+        stock_history_map = {} # New map to hold raw series for IV Rank
 
         # 1. Fetch and calculate stock technicals
         for ticker in tickers:
@@ -110,6 +146,8 @@ class FeatureEngineer:
             hist_df = self._get_historical_stock_data(ticker)
             if not hist_df.empty:
                 hist_df = self._calculate_technicals(hist_df)
+                stock_history_map[ticker] = hist_df # Save full history for IVR
+                
                 # Get the latest row for current metrics
                 latest = hist_df.iloc[-1]
                 stock_data_map[ticker] = {
@@ -120,34 +158,30 @@ class FeatureEngineer:
                 }
 
         # 2. Map stock metrics to the options dataframe
-        # Creating a DataFrame from the map to merge easily
         stock_metrics_df = pd.DataFrame.from_dict(stock_data_map, orient='index').reset_index()
         stock_metrics_df.rename(columns={'index': 'underlying_ticker'}, inplace=True)
-        
         df = pd.merge(options_df, stock_metrics_df, on='underlying_ticker', how='left')
 
-        # 3. Calculate Option Dynamics
+        # 3. Calculate IV Rank (NEW!)
+        logger.info("Transforming Volatility into IV Rank...")
+        df = self.calculate_iv_rank(df, stock_history_map)
+
+        # 4. Calculate Option Dynamics
         logger.info("Calculating Options Dynamics and Greeks...")
-        
-        # Volume/OI Ratio (Unusual activity indicator)
         df['Vol_OI_Ratio'] = df['volume'] / df['openInterest']
-        
-        # Normalized Strike Distance (How many ATRs away is the strike?)
-        # (Stock - Strike) / ATR. Positive = ITM for Calls, Negative = OTM for calls.
         df['Norm_Strike_Dist'] = (df['stock_price'] - df['strike']) / df['ATR_14']
 
         # Calculate Greeks vector-wise via apply
         greeks = df.apply(self.calculate_greeks, axis=1)
         df = pd.concat([df, greeks], axis=1)
 
-        # Drop rows with NaN (from missing historical data or calculation errors)
+        # Drop rows with NaN 
         df.dropna(subset=['Delta', 'RSI_14', 'ATR_14'], inplace=True)
         
         logger.info(f"Feature engineering complete. Dataset shape: {df.shape}")
         return df
 
 if __name__ == "__main__":
-    # To test this, we'll import the ingestion engine, grab data, and run it through features
     from data_ingestion import DataIngestionEngine
     
     test_tickers = ["AAPL"]
@@ -158,6 +192,6 @@ if __name__ == "__main__":
         engineer = FeatureEngineer()
         featured_options = engineer.process_features(raw_options)
         
-        display_cols = ['contractSymbol', 'stock_price', 'strike', 'RSI_14', 'Norm_Strike_Dist', 'Delta', 'Vol_OI_Ratio']
+        display_cols = ['contractSymbol', 'strike', 'impliedVolatility', 'IV_Rank', 'Delta']
         print("\nFeature Engineered Data Sample:")
         print(featured_options[display_cols].head())
