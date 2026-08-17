@@ -83,7 +83,8 @@ class DatabaseManager:
             Gamma REAL,
             Theta REAL,
             Vega REAL,
-            impliedVolatility REAL
+            impliedVolatility REAL,
+            IV_Rank REAL
         );
         """
 

@@ -60,7 +60,7 @@ def run_pipeline(tickers: list[str]) -> None:
 
     logger.info("[Step 6/6] Logging actionable trade signals to database...")
     # Updated to strictly enforce the Goldilocks Zone
-    generator = SignalGenerator(min_confidence=0.60, max_confidence=0.80)
+    generator = SignalGenerator()
     generator.generate_and_store_signals(scored_options)
 
     logger.info("=== PIPELINE EXECUTION COMPLETE ===")

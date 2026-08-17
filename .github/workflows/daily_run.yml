@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read # Downgraded from 'write' because we no longer commit to the repo
+  contents: write # Restored to 'write' so the bot can commit the local database
 
 jobs:
   run-pipeline:
@@ -32,13 +32,15 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-        pip install libsql-client # Required to connect to the Turso Cloud Database
 
     - name: Run Pipeline
-      env:
-        # Injects your secure cloud database keys into the pipeline
-        TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
-        TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
       run: python main.py
       
-    # The database commit step has been permanently removed.
+    - name: Commit and Push Database Update
+      run: |
+        git config --global user.name "GitHub Actions Bot"
+        git config --global user.email "actions@github.com"
+        # Force add the database file just in case it was added to .gitignore
+        git add -f data/options_pipeline.db
+        git diff --quiet && git diff --staged --quiet || git commit -m "Automated database update"
+        git push
