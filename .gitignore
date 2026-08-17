@@ -2,4 +2,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .vscode/
+# Ignore SQLite databases
+*.db
+*.sqlite3
+data/options_pipeline.db
 # We intentionally DO NOT ignore data/options_pipeline.db because we want to sync it!

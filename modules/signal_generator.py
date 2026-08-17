@@ -8,9 +8,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("SignalGenerator")
 
 class SignalGenerator:
-    def __init__(self, min_confidence: float = 0.60, max_confidence: float = 0.80):
-        self.min_confidence = min_confidence
-        self.max_confidence = max_confidence
+    # Removed min/max confidence parameters; the generator now logs the entire market
+    def __init__(self):
         self.db = DatabaseManager()
         self.profit_target_pct = 0.50  
         self.stop_loss_pct = 0.30      
@@ -19,15 +18,8 @@ class SignalGenerator:
         if scored_options_df.empty or 'confidence_score' not in scored_options_df.columns:
             return
 
-        # THE GOLDILOCKS ZONE: Reject anything outside the profitable 60-80% window
-        actionable_signals = scored_options_df[
-            (scored_options_df['confidence_score'] >= self.min_confidence) &
-            (scored_options_df['confidence_score'] <= self.max_confidence)
-        ].copy()
-
-        if actionable_signals.empty:
-            logger.info("No options fell into the Goldilocks zone today.")
-            return
+        # THE WAREHOUSE DUMP: Log every single valid contract so the ML model can learn from failures
+        actionable_signals = scored_options_df.copy()
 
         today_str = datetime.today().strftime('%Y-%m-%d %H:%M:%S')
         inserted_count = 0
@@ -39,6 +31,7 @@ class SignalGenerator:
                 signal_id = f"SIG_{uuid.uuid4().hex[:8].upper()}"
                 entry_price = row.get('mark_price', 0.0)
                 
+                # We still drop zero-bid glitch contracts
                 if entry_price <= 0:
                     continue
                     
@@ -71,4 +64,4 @@ class SignalGenerator:
                     logger.error(f"Failed to insert signal {signal_id}: {e}")
             
             conn.commit()
-            logger.info(f"Successfully saved {inserted_count} new Goldilocks signals.")
+            logger.info(f"Successfully saved {inserted_count} total signals to the database for ML training.")

@@ -6,8 +6,13 @@ on:
     - cron: '45 20 * * 1-5'
   workflow_dispatch: # This adds a "Run Now" button on GitHub so we can test it!
 
+# CONCURRENCY LOCK: Prevents simultaneous runs from corrupting the database
+concurrency:
+  group: "quant-pipeline"
+  cancel-in-progress: false
+
 permissions:
-  contents: write
+  contents: read # Downgraded from 'write' because we no longer commit to the repo
 
 jobs:
   run-pipeline:
@@ -27,16 +32,13 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
+        pip install libsql-client # Required to connect to the Turso Cloud Database
 
     - name: Run Pipeline
+      env:
+        # Injects your secure cloud database keys into the pipeline
+        TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+        TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
       run: python main.py
-
-    - name: Commit and Push Database Update
-      run: |
-        git config --global user.name "GitHub Actions Bot"
-        git config --global user.email "actions@github.com"
-        git add data/options_pipeline.db
-        
-        # Only commit if the database actually changed
-        git diff --quiet && git diff --staged --quiet || git commit -m "Automated database update"
-        git push
+      
+    # The database commit step has been permanently removed.

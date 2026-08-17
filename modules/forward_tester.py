@@ -1,7 +1,9 @@
 import yfinance as yf
+import sqlite3
 import pandas as pd
 from datetime import datetime
 import logging
+import re
 from modules.storage_setup import DatabaseManager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -50,33 +52,54 @@ class ForwardTester:
                 logger.info(f"Signal {signal_id} ({option_symbol}) EXPIRED.")
                 continue
 
-            # 3. Fetch current live price from yfinance
+            # 3. Fetch current live price from yfinance using Bid/Ask midpoint
             try:
-                ticker = yf.Ticker(option_symbol)
-                # We need the most recent quote. Using fast_info or history.
-                hist = ticker.history(period="1d")
-                if hist.empty:
-                    logger.warning(f"Could not fetch live price for {option_symbol}. Skipping.")
+                # Extract the underlying ticker from the database or the OCC option symbol
+                underlying = row.get('underlying_ticker')
+                if pd.isna(underlying) or not underlying:
+                    match = re.match(r"^([A-Z]+)\d{6}[CP]\d{8}$", option_symbol)
+                    underlying = match.group(1) if match else option_symbol
+
+                ticker = yf.Ticker(underlying)
+                exp_date_str = exp_date.strftime('%Y-%m-%d')
+                
+                # Fetch the live chain for this specific expiration
+                chain = ticker.option_chain(exp_date_str)
+                calls = chain.calls
+                
+                # Isolate our specific contract
+                contract_data = calls[calls['contractSymbol'] == option_symbol]
+                
+                if contract_data.empty:
+                    logger.warning(f"Contract {option_symbol} not found in live chain. Skipping.")
                     continue
                     
-                # Use Close price as current mark
-                current_price = hist['Close'].iloc[-1]
+                current_bid = float(contract_data['bid'].iloc[0])
+                current_ask = float(contract_data['ask'].iloc[0])
                 
+                # Calculate the true current mark price
+                current_price = (current_bid + current_ask) / 2
+                
+                # Prevent evaluating on stale zero-bid liquidity glitches
+                if current_price <= 0.01:
+                    logger.warning(f"Contract {option_symbol} has zero-bid liquidity (Mark: ${current_price:.2f}). Skipping.")
+                    continue
+                    
             except Exception as e:
-                logger.error(f"Error fetching data for {option_symbol}: {e}")
+                logger.error(f"Error fetching live chain data for {option_symbol}: {e}")
                 continue
 
-            # 4. Log this check in our evaluations table (so we can see the path it took)
+            # 4. Log this check in our evaluations table
             evaluations.append((signal_id, today_str, round(current_price, 2), "Daily Check"))
 
             # 5. Check Win/Loss conditions
             new_status = 'OPEN'
             if current_price >= target:
                 new_status = 'WON'
-                logger.info(f"Signal {signal_id} WON! Price {current_price} hit target {target}.")
+                logger.info(f"Signal {signal_id} WON! True Mark ${current_price:.2f} hit target ${target:.2f}.")
             elif current_price <= stop:
                 new_status = 'LOST'
-                logger.info(f"Signal {signal_id} LOST. Price {current_price} hit stop {stop}.")
+                logger.info(f"Signal {signal_id} LOST. True Mark ${current_price:.2f} hit stop ${stop:.2f}.")
 
             if new_status != 'OPEN':
                 updates.append(( new_status, signal_id ))
