@@ -65,10 +65,11 @@ class ForwardTester:
                 
                 # Fetch the live chain for this specific expiration
                 chain = ticker.option_chain(exp_date_str)
-                calls = chain.calls
-                
+                option_type = row.get('option_type', 'CALL')
+                contracts = chain.puts if option_type == 'PUT' else chain.calls
+
                 # Isolate our specific contract
-                contract_data = calls[calls['contractSymbol'] == option_symbol]
+                contract_data = contracts[contracts['contractSymbol'] == option_symbol]
                 
                 if contract_data.empty:
                     logger.warning(f"Contract {option_symbol} not found in live chain. Skipping.")

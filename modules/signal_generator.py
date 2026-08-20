@@ -19,7 +19,7 @@ class SignalGenerator:
             return
 
         # THE WAREHOUSE DUMP: Log every single valid contract so the ML model can learn from failures
-        actionable_signals = scored_options_df.copy()
+        actionable_signals = scored_options_df.groupby(['underlying_ticker', 'option_type']).head(3).copy()
 
         today_str = datetime.today().strftime('%Y-%m-%d %H:%M:%S')
         inserted_count = 0
