@@ -44,8 +44,8 @@ class SignalGenerator:
                     expiration_date, strike_price, entry_date, entry_mark_price, 
                     target_price, stop_loss_price, confidence_score, status,
                     RSI_14, ATR_14, EMA_Alignment, Vol_OI_Ratio, Norm_Strike_Dist,
-                    Delta, Gamma, Theta, Vega, impliedVolatility, IV_Rank
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    Delta, Gamma, Theta, Vega, impliedVolatility, IV_Rank, model_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """
                 
                 params = (
@@ -54,7 +54,7 @@ class SignalGenerator:
                     round(target_price, 2), round(stop_loss_price, 2), round(row['confidence_score'], 4), 'OPEN',
                     row.get('RSI_14'), row.get('ATR_14'), row.get('EMA_Alignment'), row.get('Vol_OI_Ratio'),
                     row.get('Norm_Strike_Dist'), row.get('Delta'), row.get('Gamma'), row.get('Theta'),
-                    row.get('Vega'), row.get('impliedVolatility'), row.get('IV_Rank')
+                    row.get('Vega'), row.get('impliedVolatility'), row.get('IV_Rank'), row.get('model_version', 'unknown')
                 )
                 
                 try:

@@ -58,7 +58,8 @@ class DatabaseManager:
             Theta REAL,
             Vega REAL,
             impliedVolatility REAL,
-            IV_Rank REAL
+            IV_Rank REAL,
+            model_version TEXT
         );
         """
 
@@ -78,6 +79,22 @@ class DatabaseManager:
                 cursor = conn.cursor()
                 cursor.execute(signals_table_sql)
                 cursor.execute(evaluations_table_sql)
+                
+                # --- BULLETPROOF SCHEMA MIGRATION ---
+                # Force inject the missing columns if Windows prevented file deletion
+                try:
+                    cursor.execute("ALTER TABLE signals ADD COLUMN IV_Rank REAL;")
+                    logger.info("Successfully patched database: Added IV_Rank column.")
+                except sqlite3.OperationalError:
+                    pass # Column already exists, safe to ignore
+                    
+                try:
+                    cursor.execute("ALTER TABLE signals ADD COLUMN model_version TEXT DEFAULT 'baseline_heuristic';")
+                    logger.info("Successfully patched database: Added model_version column.")
+                except sqlite3.OperationalError:
+                    pass # Column already exists, safe to ignore
+                # ------------------------------------
+
                 conn.commit()
             logger.info(f"Database schema successfully verified locally at {self.db_path}")
         except Exception as e:

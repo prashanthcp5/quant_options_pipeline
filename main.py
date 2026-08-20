@@ -1,6 +1,7 @@
 import logging
 import sys
 from pathlib import Path
+import pandas as pd
 
 sys.path.append(str(Path(__file__).resolve().parent))
 
@@ -46,20 +47,27 @@ def run_pipeline(tickers: list[str]) -> None:
         tester.print_performance_metrics()
         return
 
-    logger.info("[Step 5/6] Retraining ML model on live historical data...")
+    logger.info("[Step 5/6] Retraining ML model or applying Cold Start heuristic...")
     ranker = XGBoostRanker()
     historical_data = ranker.get_training_data()
     
     if len(historical_data) < 100:
-        logger.warning("Not enough feature-rich historical data. Let pipeline run longer.")
-        tester.print_performance_metrics()
-        return
+        logger.warning("Cold Start: < 100 closed trades. Bypassing ML and applying Heuristic Baseline.")
+        scored_options = featured_options.copy()
         
-    ranker.train(historical_data)
-    scored_options = ranker.predict_signals(featured_options)
+        # HEURISTIC SCORING: Low IV Rank + Higher Delta = Better Score 
+        # This formula guarantees scores roughly scale between 0.55 and 0.85
+        iv_factor = (100 - scored_options['IV_Rank']) / 100.0
+        delta_factor = scored_options['Delta'].abs()
+        
+        scored_options['confidence_score'] = 0.55 + (0.15 * iv_factor) + (0.15 * delta_factor)
+        scored_options['model_version'] = 'baseline_heuristic'
+    else:
+        ranker.train(historical_data)
+        scored_options = ranker.predict_signals(featured_options)
+        scored_options['model_version'] = 'xgb_v1'
 
     logger.info("[Step 6/6] Logging actionable trade signals to database...")
-    # Updated to strictly enforce the Goldilocks Zone
     generator = SignalGenerator()
     generator.generate_and_store_signals(scored_options)
 
