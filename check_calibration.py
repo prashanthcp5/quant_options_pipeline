@@ -20,7 +20,7 @@ import pandas as pd
 from sklearn.metrics import roc_auc_score
 
 
-def load_closed_trades(db_path: str) -> pd.DataFrame:
+def load_closed_trades(db_path: str, model_version: str = None) -> pd.DataFrame:
     conn = sqlite3.connect(db_path)
     df = pd.read_sql(
         "SELECT * FROM signals WHERE status IN ('WON', 'LOST')", conn
@@ -28,6 +28,14 @@ def load_closed_trades(db_path: str) -> pd.DataFrame:
     conn.close()
     df["entry_date"] = pd.to_datetime(df["entry_date"])
     df["y"] = (df["status"] == "WON").astype(int)
+
+    if "model_version" not in df.columns:
+        df["model_version"] = "unknown"
+    df["model_version"] = df["model_version"].fillna("unknown")
+
+    if model_version is not None:
+        df = df[df["model_version"] == model_version]
+
     return df.sort_values("entry_date").reset_index(drop=True)
 
 
@@ -46,13 +54,35 @@ def main() -> None:
         default=30,
         help="Minimum closed trades before metrics are considered meaningful.",
     )
+    parser.add_argument(
+        "--model-version",
+        default="xgb_v1",
+        help=(
+            "Only grade trades scored by this model version (default: xgb_v1). "
+            "Pass 'all' to pool every version together (not recommended), "
+            "or 'baseline_heuristic' to check the cold-start phase instead."
+        ),
+    )
     args = parser.parse_args()
 
-    df = load_closed_trades(args.db)
+    version_filter = None if args.model_version == "all" else args.model_version
+    df_all = load_closed_trades(args.db)
 
-    if df.empty:
+    print_header("MODEL VERSION BREAKDOWN (all closed trades)")
+    if df_all.empty:
         print("No closed (WON/LOST) trades yet. Nothing to check.")
         sys.exit(0)
+    print(df_all["model_version"].value_counts().to_string())
+
+    df = load_closed_trades(args.db, model_version=version_filter)
+
+    if df.empty:
+        print(f"\nNo closed trades yet for model_version='{args.model_version}'. Nothing to grade.")
+        print("(Use --model-version all to see everything pooled, or --model-version baseline_heuristic")
+        print(" to check the cold-start heuristic instead of the trained model.)")
+        sys.exit(0)
+
+    print(f"\nGrading model_version='{args.model_version}' only ({len(df)} closed trades).")
 
     print_header("SAMPLE SIZE")
     print(f"Total closed trades: {len(df)}")
