@@ -13,6 +13,9 @@ def load_data():
     df = pd.read_sql("SELECT * FROM signals", conn)
     conn.close()
     df['entry_date'] = pd.to_datetime(df['entry_date'])
+    if 'model_version' not in df.columns:
+        df['model_version'] = 'unknown'
+    df['model_version'] = df['model_version'].fillna('unknown')
     return df
 
 def main():
@@ -20,12 +23,9 @@ def main():
     st.markdown("---")
 
     df = load_data()
-    closed_df = df[df['status'].isin(['WON', 'LOST'])]
-    
-    # Define fresh cutoff (48 hours)
     fresh_cutoff = pd.Timestamp.now() - pd.Timedelta(hours=48)
     
-    # --- UI OPTIMIZATION: TABS ---
+    # --- TABS ---
     tab1, tab2, tab3, tab4 = st.tabs([
         "🚀 Paper Trade Simulator", 
         "🧠 Model Analytics", 
@@ -44,7 +44,7 @@ def main():
         
         open_df = df[df['status'] == 'OPEN'].sort_values(by='confidence_score', ascending=False)
         
-        # The 48-Hour Purge & Goldilocks Filter
+        # 48-Hour Purge, Goldilocks Filter, and Current Model Filter
         open_df = open_df[
             (open_df['confidence_score'] >= 0.60) & 
             (open_df['confidence_score'] <= 0.80) &
@@ -66,9 +66,9 @@ def main():
             open_df['Max Risk (-30%)'] = open_df['Total Spend'] * 0.30
             
             display_df = open_df[[
-                'entry_date', 'underlying_ticker', 'option_symbol', 'confidence_score', 
+                'entry_date', 'underlying_ticker', 'option_symbol', 'option_type', 'confidence_score', 
                 'Contract Cost', 'Contracts to Buy', 'Total Spend', 
-                'Target Profit (+50%)', 'Max Risk (-30%)'
+                'Target Profit (+50%)', 'Max Risk (-30%)', 'model_version'
             ]].copy()
             
             display_df['confidence_score'] = (display_df['confidence_score'] * 100).round(1).astype(str) + '%'
@@ -87,12 +87,16 @@ def main():
     with tab2:
         st.header("🧠 Machine Learning Performance")
         
-        st.markdown("### 🕒 Performance Timeframe")
-        timeframe = st.selectbox(
-            "Select timeframe to calculate metrics:", 
-            ["Last 30 Days", "Last 90 Days", "Year to Date", "All Time"],
-            index=0 
-        )
+        filter_col1, filter_col2 = st.columns(2)
+        with filter_col1:
+            timeframe = st.selectbox(
+                "Select timeframe:", 
+                ["Last 30 Days", "Last 90 Days", "Year to Date", "All Time"],
+                index=0 
+            )
+        with filter_col2:
+            available_versions = ["xgb_v1", "baseline_heuristic", "All Versions"]
+            selected_version = st.selectbox("Select Model Version:", available_versions, index=0)
         
         filtered_df = df.copy()
         today = pd.Timestamp.now().normalize()
@@ -110,7 +114,10 @@ def main():
         else:
             start_date = df['entry_date'].min() if not df.empty else today
             
-        st.caption(f"📅 **Data shown for:** {start_date.strftime('%b %d, %Y')} ➔ {today.strftime('%b %d, %Y')}")
+        if selected_version != "All Versions":
+            filtered_df = filtered_df[filtered_df['model_version'] == selected_version]
+            
+        st.caption(f"📅 **Data shown for:** {start_date.strftime('%b %d, %Y')} ➔ {today.strftime('%b %d, %Y')} | **Version:** `{selected_version}`")
             
         filtered_closed = filtered_df[filtered_df['status'].isin(['WON', 'LOST'])]
         
@@ -120,7 +127,7 @@ def main():
             goldilocks_filtered = pd.DataFrame()
 
         col1, col2, col3 = st.columns(3)
-        col1.metric(f"Generated Signals", len(filtered_df))
+        col1.metric("Generated Signals", len(filtered_df))
         if not goldilocks_filtered.empty:
             gold_wins = len(goldilocks_filtered[goldilocks_filtered['status'] == 'WON'])
             gold_win_rate = (gold_wins / len(goldilocks_filtered)) * 100
@@ -151,12 +158,12 @@ def main():
                     st.plotly_chart(fig_imp, use_container_width=True)
 
         with chart_col2:
-            st.subheader("Model Calibration (All-Time)")
-            if not closed_df.empty and 'confidence_score' in closed_df.columns:
-                calib_df = closed_df.copy()
+            st.subheader(f"Model Calibration ({selected_version})")
+            if not filtered_closed.empty and 'confidence_score' in filtered_closed.columns:
+                calib_df = filtered_closed.copy()
                 calib_df['Win'] = (calib_df['status'] == 'WON').astype(int)
-                bins = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-                labels = ['50-60%', '60-70%', '70-80%', '80-90%', '90-100%']
+                bins = [0.0, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+                labels = ['<50%', '50-60%', '60-70%', '70-80%', '80-90%', '90-100%']
                 calib_df['Confidence Bin'] = pd.cut(calib_df['confidence_score'], bins=bins, labels=labels, include_lowest=True)
                 win_rates = calib_df.groupby('Confidence Bin', observed=False)['Win'].mean().reset_index()
                 win_rates['Win'] = win_rates['Win'].fillna(0) * 100
@@ -164,26 +171,27 @@ def main():
                 fig_calib = px.bar(win_rates, x='Confidence Bin', y='Win', color='Win', color_continuous_scale='RdYlGn')
                 fig_calib.update_layout(yaxis_range=[0, 100])
                 st.plotly_chart(fig_calib, use_container_width=True)
+            else:
+                st.info("No closed trades matching this filter.")
 
     # ==========================================
     # TAB 3: OPTIONS 101 GUIDE
     # ==========================================
     with tab3:
         st.header("🎓 Options 101: A Non-Finance Guide")
-        st.markdown("Welcome to the quantitative pipeline. If you have never traded before, this guide will explain exactly what the AI is doing.")
+        st.markdown("Welcome to the quantitative pipeline. This guide explains how the system executes trades.")
         
         st.subheader("1. What is an Option?")
-        st.markdown("Think of an option like a **coupon**. If you have a coupon to buy a TV for $500, but the TV's price jumps to $1,000, your coupon just became extremely valuable. In the stock market, an option is a 'coupon' that gives you the right to buy 100 shares at a locked-in price.")
+        st.markdown("An option is a contract that gives you the right to buy (Call) or sell (Put) 100 shares at a locked-in strike price before expiration.")
 
-        st.subheader("2. What is a 'Call'?")
-        st.markdown("You buy a Call option when you think the stock price will go **UP**.")
+        st.subheader("2. Calls vs. Puts")
+        st.markdown("* **Call:** Purchased when the model expects the price to move **UP**.\n* **Put:** Purchased when the model expects the price to move **DOWN**.")
 
-        st.subheader("3. The Lifecycle of a Trade")
+        st.subheader("3. Lifecycle of a Trade")
         st.markdown("""
-        * **Phase 1: Inception:** The AI logs a specific Call Option to your dashboard.
-        * **Phase 2: Buying:** You go to your broker, search the exact `option_symbol`, and buy the contract. You only own the coupon, not the 100 shares.
-        * **Phase 3: The Wait:** As the actual price goes up, the coupon becomes more valuable.
-        * **Phase 4: Selling:** Once the value goes up by **+50%**, you click "Sell to Close" to lock in profit. If it drops **-30%**, you sell immediately to cut losses.
+        * **Phase 1: Inception:** The AI logs an actionable Call or Put signal to your dashboard.
+        * **Phase 2: Execution:** The position is simulated using mark midpoint prices.
+        * **Phase 3: Exit Target:** If the contract gains **+50%**, status updates to `WON`. If it falls **-30%**, status updates to `LOST`.
         """)
         
     # ==========================================
@@ -191,11 +199,10 @@ def main():
     # ==========================================
     with tab4:
         st.header("🤖 Monte Carlo Portfolio Optimizer")
-        st.markdown("Enter your total available capital. The engine will run 10,000 simulations to build the mathematically perfect combination of contracts that maximizes your Expected Value without exceeding your budget.")
+        st.markdown("Allocates capital across current high-conviction trades to maximize Expected Value.")
         
         opt_bankroll = st.number_input("Max Portfolio Budget ($):", min_value=100, value=500, step=50, key="opt_bankroll")
         
-        # Fetch fresh, Goldilocks signals
         mc_df = df[df['status'] == 'OPEN'].copy()
         mc_df = mc_df[
             (mc_df['confidence_score'] >= 0.60) & 
@@ -210,7 +217,6 @@ def main():
             mc_df['Suggested Risk ($)'] = (opt_bankroll * (mc_df['raw_kelly'] / 4))
             mc_df['Contract Cost'] = mc_df['entry_mark_price'] * 100
             
-            # Calculate Expected Value (EV) per contract
             mc_df['EV'] = (0.50 * mc_df['Contract Cost'] * mc_df['confidence_score']) - (0.30 * mc_df['Contract Cost'] * (1 - mc_df['confidence_score']))
             
             if st.button("Run Simulation"):
@@ -219,7 +225,6 @@ def main():
                     max_ev = -1
                     best_spend = 0
                     
-                    # 10,000 Iteration Solver
                     for _ in range(10000):
                         current_spend = 0
                         current_ev = 0
@@ -228,11 +233,8 @@ def main():
                         shuffled_options = mc_df.sample(frac=1).reset_index(drop=True)
                         
                         for idx, row in shuffled_options.iterrows():
-                            # Max constrained by absolute budget
                             max_qty_by_budget = (opt_bankroll - current_spend) // row['Contract Cost']
-                            # Max constrained by Kelly survival limit
                             max_qty_by_kelly = int(np.floor(row['Suggested Risk ($)'] / row['Contract Cost']))
-                            
                             max_allowed = int(min(max_qty_by_budget, max_qty_by_kelly))
                             
                             if max_allowed > 0:
@@ -245,6 +247,7 @@ def main():
                                     portfolio.append({
                                         'Ticker': row['underlying_ticker'],
                                         'Option': row['option_symbol'], 
+                                        'Type': row['option_type'],
                                         'Contracts': qty, 
                                         'Cost per Unit': f"${row['Contract Cost']:.2f}",
                                         'Total Allocation': spend, 
@@ -257,9 +260,7 @@ def main():
                             best_portfolio = portfolio
                     
                     if best_portfolio:
-                        st.success(f"**Optimization Complete!** Processed 10,000 scenarios.")
-                        
-                        # Summary Metrics
+                        st.success("Optimization Complete! Processed 10,000 scenarios.")
                         sum_col1, sum_col2, sum_col3 = st.columns(3)
                         sum_col1.metric("Budget Utilized", f"${best_spend:.2f}", f"{((best_spend/opt_bankroll)*100):.1f}% of Capacity")
                         sum_col2.metric("Remaining Cash", f"${(opt_bankroll - best_spend):.2f}")
@@ -267,14 +268,11 @@ def main():
                         
                         st.markdown("### 🛒 Optimized Execution Ticket")
                         port_df = pd.DataFrame(best_portfolio)
-                        
-                        # Formatting output
                         port_df['Total Allocation'] = port_df['Total Allocation'].apply(lambda x: f"${x:,.2f}")
                         port_df['Added EV'] = port_df['Added EV'].apply(lambda x: f"+${x:,.2f}")
-                        
                         st.dataframe(port_df, use_container_width=True, hide_index=True)
                     else:
-                        st.error("The Optimizer determined that your budget is too small to safely purchase any available contracts based on Kelly limits.")
+                        st.error("Budget is too small to safely purchase any available contracts based on Kelly limits.")
         else:
             st.warning("⚠️ No fresh signals available to optimize. Run `git pull` after the market closes.")
 
