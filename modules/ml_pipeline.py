@@ -78,12 +78,12 @@ class XGBoostRanker:
         params = {
             'objective': 'binary:logistic',
             'eval_metric': 'logloss',
-            'max_depth': 4,                  # Upgraded from 3 to allow slightly more complexity
-            'learning_rate': 0.05,           # Upgraded from 0.01 to take larger learning steps
+            'max_depth': 3,                  # Reverted back to 3 to prevent overfitting
+            'learning_rate': 0.01,           # Reverted back to 0.01 for cautious learning
             'subsample': 0.7,
             'colsample_bytree': 0.8,
-            'n_estimators': 100,             # Upgraded from 50 to give it more trees to learn with
-            'scale_pos_weight': dynamic_weight, # Force the model to respect the minority winning class
+            'n_estimators': 50,              # Reverted back to 50 to prevent memorization
+            'scale_pos_weight': dynamic_weight, # KEPT to prevent probability collapse
             'random_state': 42
         }
 
