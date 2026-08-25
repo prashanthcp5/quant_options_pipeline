@@ -62,17 +62,28 @@ class XGBoostRanker:
         X = df[self.features]
         y = df[self.target]
 
+        # --- THE FIX: Dynamic Class Weighting ---
+        pos_count = y.sum()
+        neg_count = len(y) - pos_count
+        
+        # If we have wins, calculate the imbalance ratio. Otherwise, default to 1.
+        dynamic_weight = (neg_count / pos_count) if pos_count > 0 else 1.0
+        
+        logger.info(f"Class Imbalance -> Won: {pos_count}, Lost: {neg_count}. Applying scale_pos_weight: {dynamic_weight:.2f}")
+
         # Standard TimeSeriesSplit (To be upgraded to Purged Group CV as data grows)
         tscv = TimeSeriesSplit(n_splits=5)
         
+        # --- THE FIX: Upgraded Hyperparameters ---
         params = {
             'objective': 'binary:logistic',
             'eval_metric': 'logloss',
-            'max_depth': 3,
-            'learning_rate': 0.01,
+            'max_depth': 4,                  # Upgraded from 3 to allow slightly more complexity
+            'learning_rate': 0.05,           # Upgraded from 0.01 to take larger learning steps
             'subsample': 0.7,
             'colsample_bytree': 0.8,
-            'n_estimators': 50,
+            'n_estimators': 100,             # Upgraded from 50 to give it more trees to learn with
+            'scale_pos_weight': dynamic_weight, # Force the model to respect the minority winning class
             'random_state': 42
         }
 
