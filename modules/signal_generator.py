@@ -18,8 +18,20 @@ class SignalGenerator:
         if scored_options_df.empty or 'confidence_score' not in scored_options_df.columns:
             return
 
-        # THE WAREHOUSE DUMP: Log every single valid contract so the ML model can learn from failures
-        actionable_signals = scored_options_df.groupby(['underlying_ticker', 'option_type']).head(3).copy()
+        # Cap exposure per ticker, but rank by confidence across BOTH directions
+        # combined, rather than per (ticker, option_type). The old grouping forced
+        # 3 calls AND 3 puts on every ticker regardless of the model's actual
+        # conviction, which meant deliberately taking the "other side" of the
+        # model's own view just to fill a quota. Ranking combined lets a
+        # strongly one-sided ticker (e.g. all-call conviction) get allocated
+        # accordingly instead of being forced into an artificial 50/50 split.
+        actionable_signals = (
+            scored_options_df
+            .sort_values('confidence_score', ascending=False)
+            .groupby('underlying_ticker')
+            .head(3)
+            .copy()
+        )
 
         today_str = datetime.today().strftime('%Y-%m-%d %H:%M:%S')
         inserted_count = 0
