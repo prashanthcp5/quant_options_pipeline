@@ -1,14 +1,12 @@
 import sqlite3
 import logging
 from pathlib import Path
-
 # Configure standard logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("StorageSetup")
-
 class DatabaseManager:
     """
     Handles connection management for the local SQLite database.
@@ -17,19 +15,16 @@ class DatabaseManager:
     def __init__(self, db_path: str = "data/options_pipeline.db"):
         self.db_path = Path(db_path)
         self._ensure_directories()
-
     def _ensure_directories(self) -> None:
         """Ensures the parent directory for the local database exists."""
         if not self.db_path.parent.exists():
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             logger.info(f"Created local directory: {self.db_path.parent}")
-
     def get_connection(self) -> sqlite3.Connection:
         """Returns a configured local sqlite3 connection."""
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row 
         return conn
-
     def initialize_schema(self) -> None:
         """
         Creates the necessary tables for signals and evaluations if they do not exist.
@@ -59,10 +54,10 @@ class DatabaseManager:
             Vega REAL,
             impliedVolatility REAL,
             IV_Rank REAL,
-            model_version TEXT
+            model_version TEXT,
+            is_actionable INTEGER DEFAULT 0
         );
         """
-
         evaluations_table_sql = """
         CREATE TABLE IF NOT EXISTS signal_evaluations (
             eval_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,7 +68,6 @@ class DatabaseManager:
             FOREIGN KEY(signal_id) REFERENCES signals(signal_id)
         );
         """
-
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
@@ -93,14 +87,18 @@ class DatabaseManager:
                     logger.info("Successfully patched database: Added model_version column.")
                 except sqlite3.OperationalError:
                     pass # Column already exists, safe to ignore
-                # ------------------------------------
 
+                try:
+                    cursor.execute("ALTER TABLE signals ADD COLUMN is_actionable INTEGER DEFAULT 0;")
+                    logger.info("Successfully patched database: Added is_actionable column.")
+                except sqlite3.OperationalError:
+                    pass # Column already exists, safe to ignore
+                # ------------------------------------
                 conn.commit()
             logger.info(f"Database schema successfully verified locally at {self.db_path}")
         except Exception as e:
             logger.error(f"Failed to initialize database schema: {e}")
             raise
-
 if __name__ == "__main__":
     db_manager = DatabaseManager()
     db_manager.initialize_schema()
