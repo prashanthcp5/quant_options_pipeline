@@ -24,6 +24,7 @@ def main():
 
     df = load_data()
     fresh_cutoff = pd.Timestamp.now() - pd.Timedelta(hours=48)
+    available_versions = ["xgb_v1", "baseline_heuristic"]
     
     # --- TABS ---
     tab1, tab2, tab3, tab4 = st.tabs([
@@ -38,25 +39,39 @@ def main():
     # ==========================================
     with tab1:
         st.header("🧮 Paper Trade Execution Calculator")
-        st.markdown("Use this calculator to simulate individual trades. **Only signals generated in the last 48 hours are shown.**")
+        st.markdown("Use this calculator to simulate individual trades. **Shows the Top 5 highest-conviction signals from the last 48 hours (excluding SPY/QQQ).**")
         
-        bankroll = st.number_input("Enter your Simulated Bankroll ($):", min_value=100, value=500, step=100, key="sim_bankroll")
+        st.warning("⚠️ **Calibration Warning:** The Kelly sizing calculator relies on the model's `confidence_score`. Because the current model is miscalibrated, Kelly sizing will be overly aggressive. Do not use for live capital until the XGBoost model is recalibrated.")
         
-        open_df = df[df['status'] == 'OPEN'].sort_values(by='confidence_score', ascending=False)
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            bankroll = st.number_input("Simulated Bankroll ($):", min_value=100, value=500, step=100, key="sim_bankroll")
+        with col2:
+            sim_version = st.selectbox("Signal Source:", available_versions, index=0, key="sim_version")
+        with col3:
+            kelly_fraction = st.selectbox("Kelly Fraction (Dampener):", [1.0, 0.5, 0.25, 0.125], index=2, format_func=lambda x: f"{x}x (1/{int(1/x)} Kelly)", help="Dial down the Kelly allocation to protect against uncalibrated probabilities.")
         
-        # 48-Hour Purge, Goldilocks Filter, and Current Model Filter
-        open_df = open_df[
-            (open_df['confidence_score'] >= 0.60) & 
-            (open_df['confidence_score'] <= 0.80) &
-            (open_df['entry_date'] >= fresh_cutoff)
-        ].copy()
+        open_df = df[df['status'] == 'OPEN'].copy()
+        
+        # 1. Filter by Model Version
+        open_df = open_df[open_df['model_version'] == sim_version]
+        
+        # 2. Blacklist macro indices (SPY, QQQ)
+        open_df = open_df[~open_df['underlying_ticker'].isin(['SPY', 'QQQ'])]
+        
+        # 3. 48-Hour Freshness Filter
+        open_df = open_df[open_df['entry_date'] >= fresh_cutoff]
+        
+        # 4. Relative Threshold: Take Top 5 Highest Conviction Signals
+        open_df = open_df.sort_values(by='confidence_score', ascending=False).head(5).copy()
         
         if not open_df.empty:
             b = 1.666 
             
+            # Apply Kelly Fraction manually selected by user (defaults to 0.25 / Quarter-Kelly)
             open_df['raw_kelly'] = open_df['confidence_score'] - ((1 - open_df['confidence_score']) / b)
             open_df['raw_kelly'] = open_df['raw_kelly'].clip(lower=0) 
-            open_df['Suggested Risk ($)'] = (bankroll * (open_df['raw_kelly'] / 4))
+            open_df['Suggested Risk ($)'] = (bankroll * (open_df['raw_kelly'] * kelly_fraction))
             
             open_df['Contract Cost'] = open_df['entry_mark_price'] * 100
             open_df['Contracts to Buy'] = np.floor(open_df['Suggested Risk ($)'] / open_df['Contract Cost']).astype(int)
@@ -68,7 +83,7 @@ def main():
             display_df = open_df[[
                 'entry_date', 'underlying_ticker', 'option_symbol', 'option_type', 'confidence_score', 
                 'Contract Cost', 'Contracts to Buy', 'Total Spend', 
-                'Target Profit (+50%)', 'Max Risk (-30%)', 'model_version'
+                'Target Profit (+50%)', 'Max Risk (-30%)'
             ]].copy()
             
             display_df['confidence_score'] = (display_df['confidence_score'] * 100).round(1).astype(str) + '%'
@@ -79,7 +94,7 @@ def main():
             
             st.dataframe(display_df, use_container_width=True, hide_index=True)
         else:
-            st.warning("⚠️ No fresh Goldilocks signals found in the last 48 hours. The system is protecting your capital.")
+            st.info(f"No fresh open signals found for `{sim_version}` in the last 48 hours.")
 
     # ==========================================
     # TAB 2: MODEL ANALYTICS
@@ -95,8 +110,8 @@ def main():
                 index=0 
             )
         with filter_col2:
-            available_versions = ["xgb_v1", "baseline_heuristic", "All Versions"]
-            selected_version = st.selectbox("Select Model Version:", available_versions, index=0)
+            tab2_versions = ["xgb_v1", "baseline_heuristic", "All Versions"]
+            selected_version = st.selectbox("Select Model Version:", tab2_versions, index=0)
         
         filtered_df = df.copy()
         today = pd.Timestamp.now().normalize()
@@ -121,21 +136,42 @@ def main():
             
         filtered_closed = filtered_df[filtered_df['status'].isin(['WON', 'LOST'])]
         
-        if not filtered_closed.empty and 'confidence_score' in filtered_closed.columns:
-            goldilocks_filtered = filtered_closed[(filtered_closed['confidence_score'] >= 0.60) & (filtered_closed['confidence_score'] <= 0.80)]
-        else:
-            goldilocks_filtered = pd.DataFrame()
+        # Isolate Non-Index Closed Trades >= 50% Confidence
+        no_index_closed = filtered_closed[~filtered_closed['underlying_ticker'].isin(['SPY', 'QQQ'])] if not filtered_closed.empty else pd.DataFrame()
+        top_tier_filtered = no_index_closed[no_index_closed['confidence_score'] >= 0.50] if not no_index_closed.empty else pd.DataFrame()
 
+        # Metrics display with explanatory hover tooltips
         col1, col2, col3 = st.columns(3)
-        col1.metric("Generated Signals", len(filtered_df))
-        if not goldilocks_filtered.empty:
-            gold_wins = len(goldilocks_filtered[goldilocks_filtered['status'] == 'WON'])
-            gold_win_rate = (gold_wins / len(goldilocks_filtered)) * 100
-            col2.metric("Goldilocks Zone Win Rate", f"{gold_win_rate:.2f}%")
-            col3.metric("Goldilocks Closed Trades", len(goldilocks_filtered))
+        col1.metric(
+            label="Generated Signals", 
+            value=len(filtered_df),
+            help="Total raw Call and Put signals logged by this model version over the selected date range, including open and closed positions."
+        )
+        
+        if not top_tier_filtered.empty:
+            top_wins = len(top_tier_filtered[top_tier_filtered['status'] == 'WON'])
+            top_win_rate = (top_wins / len(top_tier_filtered)) * 100
+            col2.metric(
+                label="Top Tier Win Rate (Non-Index >=50%)", 
+                value=f"{top_win_rate:.2f}%",
+                help="Percentage of settled single-stock trades (excl. SPY/QQQ) with >=50% confidence that hit +50% profit target before hitting -30% stop-loss."
+            )
+            col3.metric(
+                label="Top Tier Closed Trades", 
+                value=len(top_tier_filtered),
+                help="Total sample size of completed single-stock trades scoring >=50% confidence that reached a final status of WON or LOST."
+            )
         else:
-            col2.metric("Goldilocks Zone Win Rate", "N/A")
-            col3.metric("Goldilocks Closed Trades", 0)
+            col2.metric(
+                label="Top Tier Win Rate", 
+                value="N/A",
+                help="No closed single-stock trades matching >=50% confidence were found for this selection."
+            )
+            col3.metric(
+                label="Top Tier Closed Trades", 
+                value=0,
+                help="No closed single-stock trades matching >=50% confidence were found for this selection."
+            )
 
         st.markdown("---")
         chart_col1, chart_col2 = st.columns(2)
@@ -146,7 +182,7 @@ def main():
             if model_path.exists():
                 model = xgb.XGBClassifier()
                 model.load_model(model_path)
-                features = ['Delta', 'RSI_14', 'Norm_Strike_Dist', 'ATR_14', 'impliedVolatility']
+                features = ['Delta', 'RSI_14', 'Norm_Strike_Dist', 'ATR_14', 'IV_Rank']
                 
                 if len(model.feature_importances_) == len(features):
                     importance_df = pd.DataFrame({
@@ -189,8 +225,8 @@ def main():
 
         st.subheader("3. Lifecycle of a Trade")
         st.markdown("""
-        * **Phase 1: Inception:** The AI logs an actionable Call or Put signal to your dashboard.
-        * **Phase 2: Execution:** The position is simulated using mark midpoint prices.
+        * **Phase 1: Inception:** The AI logs actionable Call or Put signals to your database.
+        * **Phase 2: Execution:** The top-ranked daily signals (excluding macro indices) are dynamically selected.
         * **Phase 3: Exit Target:** If the contract gains **+50%**, status updates to `WON`. If it falls **-30%**, status updates to `LOST`.
         """)
         
@@ -199,22 +235,37 @@ def main():
     # ==========================================
     with tab4:
         st.header("🤖 Monte Carlo Portfolio Optimizer")
-        st.markdown("Allocates capital across current high-conviction trades to maximize Expected Value.")
+        st.markdown("Allocates capital across current top-conviction trades to maximize Expected Value.")
         
-        opt_bankroll = st.number_input("Max Portfolio Budget ($):", min_value=100, value=500, step=50, key="opt_bankroll")
+        st.warning("⚠️ **Calibration Warning:** EV projections rely on current confidence scores. Because the model requires recalibration, these EV figures are hypothetical. Treat output as an educational simulation.")
+        
+        opt_col1, opt_col2, opt_col3 = st.columns(3)
+        with opt_col1:
+            opt_bankroll = st.number_input("Max Portfolio Budget ($):", min_value=100, value=500, step=50, key="opt_bankroll")
+        with opt_col2:
+            opt_version = st.selectbox("Signal Source:", available_versions, index=0, key="opt_version")
+        with opt_col3:
+            opt_kelly = st.selectbox("Kelly Fraction Constraint:", [1.0, 0.5, 0.25, 0.125], index=2, format_func=lambda x: f"{x}x (1/{int(1/x)} Kelly)", key="opt_kelly")
         
         mc_df = df[df['status'] == 'OPEN'].copy()
+        
+        # 1. Filter by Model Version
+        mc_df = mc_df[mc_df['model_version'] == opt_version]
+        
+        # 2. Filter out SPY/QQQ and apply freshness cutoff
         mc_df = mc_df[
-            (mc_df['confidence_score'] >= 0.60) & 
-            (mc_df['confidence_score'] <= 0.80) &
+            (~mc_df['underlying_ticker'].isin(['SPY', 'QQQ'])) &
             (mc_df['entry_date'] >= fresh_cutoff)
         ].copy()
+        
+        # 3. Dynamic Relative Top 5 selection
+        mc_df = mc_df.sort_values(by='confidence_score', ascending=False).head(5).copy()
         
         if not mc_df.empty:
             b = 1.666 
             mc_df['raw_kelly'] = mc_df['confidence_score'] - ((1 - mc_df['confidence_score']) / b)
             mc_df['raw_kelly'] = mc_df['raw_kelly'].clip(lower=0) 
-            mc_df['Suggested Risk ($)'] = (opt_bankroll * (mc_df['raw_kelly'] / 4))
+            mc_df['Suggested Risk ($)'] = (opt_bankroll * (mc_df['raw_kelly'] * opt_kelly))
             mc_df['Contract Cost'] = mc_df['entry_mark_price'] * 100
             
             mc_df['EV'] = (0.50 * mc_df['Contract Cost'] * mc_df['confidence_score']) - (0.30 * mc_df['Contract Cost'] * (1 - mc_df['confidence_score']))
@@ -274,7 +325,7 @@ def main():
                     else:
                         st.error("Budget is too small to safely purchase any available contracts based on Kelly limits.")
         else:
-            st.warning("⚠️ No fresh signals available to optimize. Run `git pull` after the market closes.")
+            st.warning("⚠️ No fresh signals available to optimize. Check your data ingestion script.")
 
 if __name__ == "__main__":
     main()
