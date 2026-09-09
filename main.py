@@ -2,6 +2,8 @@ import logging
 import sys
 from pathlib import Path
 import pandas as pd
+import pandas_market_calendars as mcal
+from datetime import date
 
 sys.path.append(str(Path(__file__).resolve().parent))
 
@@ -18,8 +20,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger("MainPipeline")
 
+
+def is_market_open_today() -> bool:
+    """
+    Checks the real NYSE calendar (weekends + all federal market holidays)
+    instead of assuming every weekday is a trading day. Without this,
+    yfinance silently returns the last available close on holidays, and the
+    pipeline treats that stale chain as if it were fresh - generating
+    duplicate "new" signals for contracts that already exist in the DB.
+    """
+    nyse = mcal.get_calendar('NYSE')
+    today_str = date.today().strftime('%Y-%m-%d')
+    schedule = nyse.schedule(start_date=today_str, end_date=today_str)
+    return not schedule.empty
+
+
 def run_pipeline(tickers: list[str]) -> None:
     logger.info("=== STARTING OPTIONS QUANT PIPELINE ===")
+
+    if not is_market_open_today():
+        logger.warning(
+            f"Market is closed today ({date.today()}) - weekend or holiday. "
+            "Skipping data ingestion and signal generation to avoid trading "
+            "stale/duplicate option chain data."
+        )
+        return
 
     logger.info("[Step 1/6] Initializing database storage...")
     db = DatabaseManager()
@@ -50,16 +75,14 @@ def run_pipeline(tickers: list[str]) -> None:
     logger.info("[Step 5/6] Retraining ML model or applying Cold Start heuristic...")
     ranker = XGBoostRanker()
     historical_data = ranker.get_training_data()
-    
+
     if len(historical_data) < 100:
         logger.warning("Cold Start: < 100 closed trades. Bypassing ML and applying Heuristic Baseline.")
         scored_options = featured_options.copy()
-        
-        # HEURISTIC SCORING: Low IV Rank + Higher Delta = Better Score 
-        # This formula guarantees scores roughly scale between 0.55 and 0.85
+
         iv_factor = (100 - scored_options['IV_Rank']) / 100.0
         delta_factor = scored_options['Delta'].abs()
-        
+
         scored_options['confidence_score'] = 0.55 + (0.15 * iv_factor) + (0.15 * delta_factor)
         scored_options['model_version'] = 'baseline_heuristic'
     else:
@@ -73,6 +96,7 @@ def run_pipeline(tickers: list[str]) -> None:
 
     logger.info("=== PIPELINE EXECUTION COMPLETE ===")
     tester.print_performance_metrics()
+
 
 if __name__ == "__main__":
     target_tickers = ["SPY", "QQQ", "AAPL", "NVDA", "SOFI", "F", "NIO"]
