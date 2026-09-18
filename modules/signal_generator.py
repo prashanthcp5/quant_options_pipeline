@@ -14,41 +14,78 @@ class SignalGenerator:
         self.stop_loss_pct = 0.30
 
         # --- TOP-N ALLOCATION RULES (for what actually gets traded) ---
-        self.max_daily_trades = 5  # Total actionable trades to open per day across the whole market
-        self.max_per_ticker = 1    # Max actionable trades per underlying to prevent piling into one stock
+        self.max_daily_trades = 5  # Max actionable trades per day across the whole market
+        self.max_per_ticker = 1    # Max actionable trades per underlying
+
+        # --- QUALITY FLOOR ---
+        # The system used to be FORCED to flag 5 trades every single day, even
+        # on days where the model had no conviction about anything (observed
+        # minimum confidence among forced picks: 0.000). Out-of-fold testing
+        # showed this dragged win rate from ~49% (top picks only) down to ~38%.
+        # "Trade nothing today" is a valid action and this floor allows it.
+        #
+        # Only applies to xgb_v1, whose scores are real probabilities. The
+        # baseline_heuristic produces scores bounded 0.55-0.85 by construction
+        # (a hand-tuned formula, not a probability), so the same numeric floor
+        # would mean something completely different there.
+        self.min_confidence_floor = 0.70
+        self.floor_applies_to = {'xgb_v1'}
 
         # --- TICKER EXCLUSIONS ---
-        # Exclude broad indices because their volatility profile doesn't match our +50%/-30% targets
         self.excluded_tickers = ['SPY', 'QQQ']
 
     def generate_and_store_signals(self, scored_options_df: pd.DataFrame) -> None:
         if scored_options_df.empty or 'confidence_score' not in scored_options_df.columns:
             return
 
-        # 1. Filter out structurally incompatible tickers before doing any ranking.
-        #    These are excluded from BOTH trading and training - SPY/QQQ have a
-        #    volatility profile that doesn't fit the +50%/-30% target/stop, so
-        #    there's no reason to keep learning from them either.
+        # 1. Filter out structurally incompatible tickers before ranking.
         filtered_df = scored_options_df[~scored_options_df['underlying_ticker'].isin(self.excluded_tickers)].copy()
 
         if filtered_df.empty:
             logger.info("No actionable signals remaining after applying ticker exclusions.")
             return
 
-        # 2. Work out which rows qualify as "actionable" (the disciplined top-5,
-        #    max-1-per-ticker picks) WITHOUT throwing away everything else.
-        #    Everything in filtered_df still gets stored for training - only
-        #    the top-5 diversified subset gets flagged as actionable for the
-        #    paper-trade simulator / dashboard to act on.
-        actionable_subset = (
-            filtered_df
-            .sort_values('confidence_score', ascending=False)
-            .groupby('underlying_ticker')
-            .head(self.max_per_ticker)
-            .sort_values('confidence_score', ascending=False)
-            .head(self.max_daily_trades)
-        )
-        actionable_symbols = set(actionable_subset['contractSymbol'])
+        # 2. Determine which rows qualify as "actionable". Everything in
+        #    filtered_df is still STORED for training - the floor and the
+        #    top-N caps only control the is_actionable flag, never storage.
+        candidates = filtered_df.copy()
+
+        model_version = str(candidates['model_version'].iloc[0]) if 'model_version' in candidates.columns else 'unknown'
+        floor_active = model_version in self.floor_applies_to
+
+        if floor_active:
+            pre_floor_count = len(candidates)
+            best_available = candidates['confidence_score'].max()
+            candidates = candidates[candidates['confidence_score'] >= self.min_confidence_floor]
+            if candidates.empty:
+                logger.info(
+                    f"No signal cleared the {self.min_confidence_floor:.2f} quality floor today "
+                    f"(best available: {best_available:.4f} out of {pre_floor_count} candidates). "
+                    "Flagging zero actionable trades - sitting this day out."
+                )
+            else:
+                logger.info(
+                    f"{len(candidates)}/{pre_floor_count} candidates cleared the "
+                    f"{self.min_confidence_floor:.2f} quality floor."
+                )
+        else:
+            logger.info(
+                f"Quality floor not applied for model_version='{model_version}' "
+                "(floor is calibrated for xgb_v1 probabilities only)."
+            )
+
+        if candidates.empty:
+            actionable_symbols = set()
+        else:
+            actionable_subset = (
+                candidates
+                .sort_values('confidence_score', ascending=False)
+                .groupby('underlying_ticker')
+                .head(self.max_per_ticker)
+                .sort_values('confidence_score', ascending=False)
+                .head(self.max_daily_trades)
+            )
+            actionable_symbols = set(actionable_subset['contractSymbol'])
 
         today_str = datetime.today().strftime('%Y-%m-%d %H:%M:%S')
         inserted_count = 0
@@ -57,15 +94,12 @@ class SignalGenerator:
         with self.db.get_connection() as conn:
             cursor = conn.cursor()
 
-            # Store EVERY non-excluded signal, not just the top 5. The model
-            # needs a broad, varied sample to train on - narrowing storage to
-            # only the top picks would recreate the same feedback-loop problem
-            # we already fixed once before.
+            # Store EVERY non-excluded signal, not just the actionable ones.
+            # The model needs a broad, varied sample to train on.
             for _, row in filtered_df.iterrows():
                 signal_id = f"SIG_{uuid.uuid4().hex[:8].upper()}"
                 entry_price = row.get('mark_price', 0.0)
 
-                # We still drop zero-bid glitch contracts
                 if entry_price <= 0:
                     continue
 
